@@ -3,36 +3,116 @@ import random
 import sys
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
-from transformers import AutoProcessor
 import json
 import argparse
-from PIL import Image
 from pathlib import Path
-from vllm import LLM, SamplingParams
-import torch
-from huggingface_hub import login
 from tqdm import tqdm
-import logging
+from groq import Groq
+import time
 import pandas as pd
 from collections import Counter
 
-# Set up logging to suppress vLLM progress bars
-logging.getLogger("vllm").setLevel(logging.WARNING)
+# Progress bar settings
 tqdm_kwargs = dict(file=sys.stdout)
-os.environ["VLLM_LOGGING_LEVEL"] = "WARNING"
-
-login("XXXXXXXXXXXXXXXXXXXXXXXXXXXX")  # Replace with your actual Hugging Face token
 
 # Label mappings for MSED tasks
+# IMPORTANT:
+# Evaluation must use the ground-truth annotation schema available in the dataset.
+# captions_test.csv contains only emotion labels with this schema:
+# awe, contentment, excitement, anger, sadness, amusement, fear, disgust.
+# Sentiment/desire are kept for compatibility with other datasets, but they are not
+# evaluated unless the input dataset actually contains those ground-truth columns.
 sentiment_map = {"a": "positive", "b": "negative", "c": "neutral"}
 emotion_map = {
-    "a": "happiness", "b": "sad", "c": "neutral",
-    "d": "disgust", "e": "anger", "f": "fear"
+    "a": "awe",
+    "b": "contentment",
+    "c": "excitement",
+    "d": "anger",
+    "e": "sadness",
+    "f": "amusement",
+    "g": "fear",
+    "h": "disgust",
 }
 desire_map = {
     "a": "vengeance", "b": "curiosity", "c": "social-contact",
     "d": "family", "e": "tranquility", "f": "romance", "g": "none"
 }
+
+TASK_LABEL_MAPS = {
+    "sentiment": sentiment_map,
+    "emotion": emotion_map,
+    "desire": desire_map,
+}
+
+def normalize_label(label) -> Optional[str]:
+    """Normalize labels so prediction and ground truth are compared in the same label space."""
+    if label is None or pd.isna(label):
+        return None
+    label = str(label).strip().lower()
+    label = label.replace("_", "-")
+    aliases = {
+        "happy": "amusement",
+        "happiness": "amusement",
+        "sad": "sadness",
+    }
+    return aliases.get(label, label)
+
+def get_available_tasks(ground_truth: List[Dict]) -> List[str]:
+    """Return only tasks that have actual ground-truth annotations in this dataset."""
+    available_tasks = []
+    for task in ["sentiment", "emotion", "desire"]:
+        if any(task in label_dict and label_dict.get(task) is not None for label_dict in ground_truth):
+            available_tasks.append(task)
+    return available_tasks
+
+def get_existing_completed_keys(output_path: str) -> set:
+    """Read existing CSV output and return completed (mode, task, sample_id) keys for resume."""
+    csv_path = output_path if str(output_path).endswith('.csv') else f"{output_path}.csv"
+    if not os.path.exists(csv_path):
+        return set()
+    try:
+        existing_df = pd.read_csv(csv_path)
+        required_cols = {"mode", "task", "sample_id"}
+        if not required_cols.issubset(set(existing_df.columns)):
+            return set()
+        existing_df = existing_df.dropna(subset=["mode", "task", "sample_id"])
+        return set(
+            (str(row["mode"]), str(row["task"]), int(row["sample_id"]))
+            for _, row in existing_df.iterrows()
+        )
+    except Exception as e:
+        print(f"Warning: Could not read existing output file for resume: {e}", flush=True)
+        return set()
+
+def append_progress_row(output_path: str, mode: str, pred: "PredictionResult", gt_label: Optional[str]):
+    """Append one completed prediction immediately so progress is not lost if the run stops."""
+    if not output_path:
+        return
+
+    csv_path = output_path if str(output_path).endswith('.csv') else f"{output_path}.csv"
+    row = {
+        'mode': mode,
+        'task': pred.task,
+        'sample_id': pred.sample_id,
+        'image_filename': f"{pred.sample_id}.jpg" if pred.sample_id else None,
+        'predicted_label': pred.label,
+        'prediction_letter': pred.prediction,
+        'ground_truth': gt_label,
+        'correct': pred.label == gt_label if gt_label else None,
+        'input_text': pred.input_text,
+        'reasoning': pred.reasoning,
+        'raw_llm_output': pred.raw_llm_output,
+        'image_path': pred.image_path
+    }
+
+    file_exists = os.path.exists(csv_path)
+    pd.DataFrame([row]).to_csv(
+        csv_path,
+        mode='a' if file_exists else 'w',
+        header=not file_exists,
+        index=False,
+        encoding='utf-8'
+    )
 
 @dataclass
 class PredictionResult:
@@ -54,41 +134,30 @@ class MSEDAnalyzer:
         
         # Set random seed for reproducibility
         random.seed(seed)
-        torch.manual_seed(seed)
-        
-        # Initialize processor for LLaVA-1.6
-        self.processor = AutoProcessor.from_pretrained(model_name)
-        
-        # Initialize vLLM engine with proper configuration for LLaVA-1.6
-        self.llm = LLM(
-            model=model_name,
-            max_model_len=4096,
-            max_num_seqs=1,
-            limit_mm_per_prompt={"image": 1},
-            enforce_eager=False,
-            tensor_parallel_size=1,
-            gpu_memory_utilization=0.9,
-            trust_remote_code=True
-        )
-        
-        # Sampling parameters for chain-of-thought
-        self.sampling_params = SamplingParams(
-            temperature=0.0,
-            max_tokens=512,
-            stop=["</s>", "USER:", "ASSISTANT:"]
-        )
+
+        # Groq API backend. This replaces ONLY the local LLaVA/vLLM backend.
+        # All task prompts, label maps, extraction logic, evaluation, and saving logic are kept the same.
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "GROQ_API_KEY is not set. Set it first, e.g. "
+                'Windows PowerShell: setx GROQ_API_KEY "your_key_here"'
+            )
+
+        self.client = Groq(api_key=api_key)
+        self.model_name = model_name
+        self.temperature = 0.0
+        self.max_tokens = 512
     
-    def load_and_validate_image(self, image_path: str) -> Optional[Image.Image]:
-        """Load and validate an image"""
-        try:
-            image = Image.open(image_path).convert("RGB")
-            # Validate image size
-            if image.size[0] * image.size[1] > 4096 * 4096:  # Resize if too large
-                image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
-            return image
-        except Exception as e:
-            return None
-    
+    def load_and_validate_image(self, image_path: str):
+        """Image loading is intentionally disabled for Groq llama-3.3-70b-versatile.
+
+        The original LLaVA baseline supported image and multimodal modes.
+        Groq llama-3.3-70b-versatile is a text-only chat model, so for fair
+        caption-based experiments use --mode text.
+        """
+        return None
+
     def create_text_only_prompt(self, text: str, task: str) -> Dict:
         """Create prompt for text-only analysis"""
         
@@ -100,15 +169,17 @@ a = positive
 b = negative  
 c = neutral"""
         elif task == "emotion":
-            task_desc = """Analyze the primary emotion expressed in this text.
-    
+            task_desc = """Analyze the primary emotion expressed in this text using the dataset's ground-truth emotion schema.
+
 **Classification Options:**
-a = happiness
-b = sad
-c = neutral
-d = disgust
-e = anger
-f = fear"""
+a = awe
+b = contentment
+c = excitement
+d = anger
+e = sadness
+f = amusement
+g = fear
+h = disgust"""
         elif task == "desire":
             task_desc = """Analyze the underlying desire or need expressed in this text.
     
@@ -121,11 +192,7 @@ e = tranquility
 f = romance
 g = none"""
         
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": f"""{task_desc}
+        prompt_text = f"""{task_desc}
 
 Text: "{text}"
 
@@ -134,16 +201,7 @@ First, explain your reasoning step-by-step. Then provide your final answer as a 
 
 **Format your response exactly as:**
 Reasoning: [your analysis]
-Final Answer: [letter]"""}
-                ]
-            }
-        ]
-        
-        prompt_text = self.processor.apply_chat_template(
-            conversation,
-            add_generation_prompt=True,
-            tokenize=False
-        )
+Final Answer: [letter]"""
         
         if self.debug_mode:
             print(f"\n🎯 Text-only {task} prompt created")
@@ -152,144 +210,25 @@ Final Answer: [letter]"""}
         return {"prompt": prompt_text, "multi_modal_data": None}
     
     def create_image_only_prompt(self, image_path: str, task: str) -> Optional[Dict]:
-        """Create prompt for image-only analysis"""
-        
-        image = self.load_and_validate_image(image_path)
-        if image is None:
-            return None
-        
-        if task == "sentiment":
-            task_desc = """Analyze the sentiment conveyed by this image.
-    
-**Classification Options:**
-a = positive
-b = negative  
-c = neutral"""
-        elif task == "emotion":
-            task_desc = """Analyze the primary emotion expressed in this image.
-    
-**Classification Options:**
-a = happiness
-b = sad
-c = neutral
-d = disgust
-e = anger
-f = fear"""
-        elif task == "desire":
-            task_desc = """Analyze what desire or need this image represents.
-    
-**Classification Options:**
-a = vengeance
-b = curiosity
-c = social-contact
-d = family
-e = tranquility
-f = romance
-g = none"""
-        
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": f"""{task_desc}
+        """Image-only mode is not supported by Groq llama-3.3-70b-versatile.
 
-**Instructions:**
-First, explain your reasoning step-by-step. Then provide your final answer as a single letter.
-
-**Format your response exactly as:**
-Reasoning: [your analysis]
-Final Answer: [letter]"""}
-                ]
-            }
-        ]
-        
-        prompt_text = self.processor.apply_chat_template(
-            conversation,
-            add_generation_prompt=True,
-            tokenize=False
-        )
-        
+        Kept as a function so the rest of the original code structure remains intact.
+        Use --mode text for caption-based experiments.
+        """
         if self.debug_mode:
-            print(f"\n🎯 Image-only {task} prompt created")
-            print(f"   Image: {image_path}")
-        
-        return {
-            "prompt": prompt_text,
-            "multi_modal_data": {"image": image}
-        }
-    
+            print(f"\n⚠️ Image-only {task} skipped: Groq llama-3.3-70b-versatile is text-only")
+        return None
+
     def create_multimodal_prompt(self, text: str, image_path: str, task: str) -> Optional[Dict]:
-        """Create prompt for multimodal analysis"""
-        
-        image = self.load_and_validate_image(image_path)
-        if image is None:
-            return None
-        
-        if task == "sentiment":
-            task_desc = """Analyze the combined sentiment of this image and text together.
-    
-**Classification Options:**
-a = positive
-b = negative  
-c = neutral"""
-        elif task == "emotion":
-            task_desc = """Analyze the primary emotion expressed by combining this image and text.
-    
-**Classification Options:**
-a = happiness
-b = sad
-c = neutral
-d = disgust
-e = anger
-f = fear"""
-        elif task == "desire":
-            task_desc = """Analyze what desire or need is expressed by combining this image and text.
-    
-**Classification Options:**
-a = vengeance
-b = curiosity
-c = social-contact
-d = family
-e = tranquility
-f = romance
-g = none"""
-        
-        conversation = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": f"""{task_desc}
+        """Multimodal mode is not supported by Groq llama-3.3-70b-versatile.
 
-Text: "{text}"
-
-**Instructions:**
-First, explain your reasoning step-by-step. Then provide your final answer as a single letter.
-
-**Format your response exactly as:**
-Reasoning: [your analysis]
-Final Answer: [letter]"""}
-                ]
-            }
-        ]
-        
-        prompt_text = self.processor.apply_chat_template(
-            conversation,
-            add_generation_prompt=True,
-            tokenize=False
-        )
-        
+        Kept as a function so the rest of the original code structure remains intact.
+        Use --mode text for caption-based experiments.
+        """
         if self.debug_mode:
-            print(f"\n🎯 Multimodal {task} prompt created")
-            print(f"   Text: {text[:100]}...")
-            print(f"   Image: {image_path}")
-        
-        return {
-            "prompt": prompt_text,
-            "multi_modal_data": {"image": image}
-        }
-    
+            print(f"\n⚠️ Multimodal {task} skipped: Groq llama-3.3-70b-versatile is text-only")
+        return None
+
     def extract_label_from_text(self, text: str) -> str:
         """Extract label from generated text with multiple strategies"""
         
@@ -300,13 +239,13 @@ Final Answer: [letter]"""}
         text = text.strip().lower()
         
         # Strategy 1: Check if the text is just a single letter
-        if len(text) == 1 and text in 'abcdefg':
+        if len(text) == 1 and text in 'abcdefgh':
             return text
         
         # Strategy 2: Look for the last valid letter in the text (most likely the final answer)
         valid_letters = []
         for char in reversed(text):
-            if char in 'abcdefg':
+            if char in 'abcdefgh':
                 valid_letters.append(char)
         
         if valid_letters:
@@ -316,21 +255,21 @@ Final Answer: [letter]"""}
         import re
         
         # Pattern for "Response: X" or "Answer: X" or just ": X"
-        response_pattern = r'(?:response|answer|result)?\s*:?\s*([abcdefg])'
+        response_pattern = r'(?:response|answer|result)?\s*:?\s*([abcdefgh])'
         matches = re.findall(response_pattern, text)
         if matches:
             return matches[-1]  # Return the last match
         
         # Strategy 4: Look for the letter after common phrases
         common_phrases = [
-            r'the answer is\s*([abcdefg])',
-            r'i choose\s*([abcdefg])',
-            r'my response is\s*([abcdefg])',
-            r'therefore\s*([abcdefg])',
-            r'so\s*([abcdefg])',
-            r'thus\s*([abcdefg])',
-            r'final answer\s*:?\s*([abcdefg])',
-            r'conclusion\s*:?\s*([abcdefg])'
+            r'the answer is\s*([abcdefgh])',
+            r'i choose\s*([abcdefgh])',
+            r'my response is\s*([abcdefgh])',
+            r'therefore\s*([abcdefgh])',
+            r'so\s*([abcdefgh])',
+            r'thus\s*([abcdefgh])',
+            r'final answer\s*:?\s*([abcdefgh])',
+            r'conclusion\s*:?\s*([abcdefgh])'
         ]
         
         for pattern in common_phrases:
@@ -339,7 +278,7 @@ Final Answer: [letter]"""}
                 return matches[-1]  # Return the last match
         
         # Strategy 5: Look for standalone letters (word boundaries)
-        standalone_pattern = r'\b([abcdefg])\b'
+        standalone_pattern = r'\b([abcdefgh])\b'
         matches = re.findall(standalone_pattern, text)
         if matches:
             return matches[-1]  # Return the last standalone letter
@@ -348,12 +287,12 @@ Final Answer: [letter]"""}
         # Split by common separators and check each part
         parts = re.split(r'[.,!?;:\n\t\s]+', text)
         for part in reversed(parts):
-            if part and len(part) == 1 and part in 'abcdefg':
+            if part and len(part) == 1 and part in 'abcdefgh':
                 return part
         
         # Strategy 7: Look for the first valid letter as fallback
         for char in text:
-            if char in 'abcdefg':
+            if char in 'abcdefgh':
                 return char
         
         # Default fallback
@@ -365,23 +304,18 @@ Final Answer: [letter]"""}
         """Generate prediction with reasoning"""
         
         try:
-            # Check if this is text-only or multimodal
-            is_multimodal = prompt_data.get("multi_modal_data") is not None
-            
-            if is_multimodal:
-                outputs = self.llm.generate(
-                    [prompt_data],
-                    sampling_params=self.sampling_params,
-                    use_tqdm=False
-                )
-            else:
-                outputs = self.llm.generate(
-                    [prompt_data["prompt"]],
-                    sampling_params=self.sampling_params,
-                    use_tqdm=False
-                )
-            
-            generated_text = outputs[0].outputs[0].text.strip()
+            # Groq API call. This replaces self.llm.generate(...) only.
+            # The prompt text and downstream parsing remain the same as the original code.
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "user", "content": prompt_data["prompt"]}
+                ],
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+
+            generated_text = response.choices[0].message.content.strip()
             raw_llm_output = generated_text
             
             # Parse reasoning and prediction
@@ -452,35 +386,74 @@ Final Answer: [letter]"""}
             raise ValueError(f"Unknown task: {task}")
     
     def analyze_text_only(self, texts: List[str], 
-                         sample_ids: List[int] = None) -> Dict[str, List[PredictionResult]]:
-        """Perform text-only analysis for all tasks"""
-        
+                         sample_ids: List[int] = None,
+                         image_paths: List[str] = None,
+                         tasks: List[str] = None,
+                         ground_truth: List[Dict] = None,
+                         output_path: str = None,
+                         existing_keys: set = None) -> Dict[str, List[PredictionResult]]:
+        """Perform text-only analysis only for tasks that have ground truth in the dataset.
+
+        This prevents evaluating sentiment/desire on captions_test.csv because those
+        annotations are not present. It also supports resumable progress by skipping
+        predictions already present in the output CSV.
+        """
+
         if sample_ids is None:
             sample_ids = list(range(len(texts)))
-        
-        results = {"sentiment": [], "emotion": [], "desire": []}
-        total_operations = len(texts) * 3
-        
-        with tqdm(total=total_operations, desc="Text-Only Analysis", unit="prediction", **tqdm_kwargs) as pbar:
-            for i, (text, sample_id) in enumerate(zip(texts, sample_ids)):
-                for task in ["sentiment", "emotion", "desire"]:
+
+        if image_paths is None:
+            image_paths = [None] * len(texts)
+
+        if tasks is None:
+            tasks = ["sentiment", "emotion", "desire"]
+
+        if ground_truth is None:
+            ground_truth = [{} for _ in texts]
+
+        if existing_keys is None:
+            existing_keys = set()
+
+        results = {task: [] for task in tasks}
+        pending_operations = sum(
+            1
+            for sample_id in sample_ids
+            for task in tasks
+            if ("text_only", task, int(sample_id)) not in existing_keys
+        )
+
+        if pending_operations == 0:
+            print("All requested text-only predictions already exist in the output file. Nothing new to process.", flush=True)
+            return results
+
+        with tqdm(total=pending_operations, desc="Text-Only Analysis", unit="prediction", **tqdm_kwargs) as pbar:
+            for i, (text, sample_id, image_path) in enumerate(zip(texts, sample_ids, image_paths)):
+                for task in tasks:
+                    resume_key = ("text_only", task, int(sample_id))
+                    if resume_key in existing_keys:
+                        continue
+
                     prompt_data = self.create_text_only_prompt(text, task)
-                    
+
                     result = self.generate_prediction(
-                        prompt_data, task, sample_id, text, None
+                        prompt_data, task, sample_id, text, image_path
                     )
-                    
+
                     results[task].append(result)
-                    
+
+                    gt_label = ground_truth[i].get(task) if i < len(ground_truth) else None
+                    append_progress_row(output_path, "text_only", result, gt_label)
+                    existing_keys.add(resume_key)
+
                     pbar.set_postfix({
                         'Sample': f"{i+1}/{len(texts)}",
                         'Task': task,
                         'Result': f"{result.prediction}→{result.label}"
                     })
                     pbar.update(1)
-        
+
         return results
-    
+
     def analyze_image_only(self, image_paths: List[str], 
                           sample_ids: List[int] = None) -> Dict[str, List[PredictionResult]]:
         """Perform image-only analysis for all tasks"""
@@ -587,10 +560,16 @@ def load_msed_dataset(dataset_path: str, split: str = 'test',
     sample_ids = []
     
     dataset_dir = Path(dataset_path)
-    split_dir = dataset_dir / split
-    
-    # Load CSV file
-    csv_path = split_dir / f'{split}.csv'
+
+    # Original behavior: dataset_path points to an MSED directory containing split/split.csv.
+    # Added compatibility: dataset_path can also point directly to a CSV such as captions_test.csv.
+    if dataset_dir.is_file() and dataset_dir.suffix.lower() == ".csv":
+        csv_path = dataset_dir
+        split_dir = dataset_dir.parent
+    else:
+        split_dir = dataset_dir / split
+        csv_path = split_dir / f'{split}.csv'
+
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV file not found: {csv_path}")
     
@@ -623,28 +602,32 @@ def load_msed_dataset(dataset_path: str, split: str = 'test',
         # Images are 1-indexed (1.jpg, 2.jpg, ...) while CSV rows are 0-indexed
         # So row 0 maps to image 1.jpg, row 1 maps to image 2.jpg, etc.
         image_id = idx + 1
+
+        # Construct image path. If the CSV already has image_path, use it; otherwise use original MSED convention.
+        # For Groq text-only experiments, do not skip rows just because images are unavailable.
+        # Image and multimodal modes are unsupported by this text-only Groq model anyway.
         
-        # Construct image path
-        image_name = f"{image_id}.jpg"
-        image_path = split_dir / 'images' / image_name
-        
-        # Check if image exists
-        if not image_path.exists():
-            print(f"Warning: Image not found: {image_path}, skipping...")
-            continue
+        if 'image_path' in df.columns and pd.notna(row['image_path']):
+            image_path_value = str(row['image_path'])
+            
+        else:
+            image_name = f"{image_id}.jpg"
+            image_path = split_dir / 'images' / image_name
+            image_path_value = str(image_path) if image_path.exists() else None
         
         texts.append(text_content)
-        image_paths.append(str(image_path))
+        image_paths.append(image_path_value)
         sample_ids.append(image_id)  # Use image_id (1-indexed) instead of idx
         
-        # Extract ground truth labels
+        # Extract ground truth labels. Supports both original MSED column names and lowercase CSV names.
         label_dict = {}
-        if 'Sentiment' in df.columns and pd.notna(row['Sentiment']):
-            label_dict['sentiment'] = str(row['Sentiment']).lower()
-        if 'Emotion' in df.columns and pd.notna(row['Emotion']):
-            label_dict['emotion'] = str(row['Emotion']).lower()
-        if 'Desire' in df.columns and pd.notna(row['Desire']):
-            label_dict['desire'] = str(row['Desire']).lower()
+        for source_col, target_task in [
+            ('Sentiment', 'sentiment'), ('sentiment', 'sentiment'),
+            ('Emotion', 'emotion'), ('emotion', 'emotion'),
+            ('Desire', 'desire'), ('desire', 'desire'),
+        ]:
+            if source_col in df.columns and pd.notna(row[source_col]):
+                label_dict[target_task] = normalize_label(row[source_col])
         
         labels.append(label_dict)
         
@@ -652,7 +635,7 @@ def load_msed_dataset(dataset_path: str, split: str = 'test',
         if len(texts) <= 3:
             print(f"   - Sample {len(texts)}: CSV Row {idx} → Image ID {image_id}", flush=True)
             print(f"     Text: {text_content[:100]}...", flush=True)
-            print(f"     Image: {image_path}", flush=True)
+            print(f"     Image: {image_path_value}", flush=True)
             print(f"     Labels: {label_dict}", flush=True)
     
     print(f"Loaded {len(texts)} samples from MSED {split} split", flush=True)
@@ -669,128 +652,148 @@ def load_msed_dataset(dataset_path: str, split: str = 'test',
 
 
 def save_results(results: Dict[str, Dict[str, List[PredictionResult]]], 
-                ground_truth: List[Dict], output_path: str, seed: int = 42):
-    """Save results with debugging information in both JSON and CSV formats"""
-    
-    # Prepare data for JSON
-    json_results = {}
-    summaries = {}
-    
-    # Prepare data for CSV (flat structure)
+                ground_truth: List[Dict], output_path: str, seed: int = 42,
+                tasks: List[str] = None):
+    """Save results with debugging information in both JSON and CSV formats.
+
+    Resume behavior:
+    - Existing CSV rows are preserved.
+    - New rows are appended during processing.
+    - Final save de-duplicates by (mode, task, sample_id), keeping the first row,
+      so already completed work is not replaced.
+    """
+
+    if tasks is None:
+        tasks = ["sentiment", "emotion", "desire"]
+
+    csv_path = output_path if output_path.endswith('.csv') else f"{output_path}.csv"
+    json_path = output_path.replace('.csv', '.json') if output_path.endswith('.csv') else f"{output_path}.json"
+
+    # Prepare newly collected rows in case append_progress_row was disabled or interrupted.
     csv_data = []
-    
     for mode, mode_results in results.items():
-        json_results[mode] = {}
-        summaries[mode] = {}
-        
         for task, pred_list in mode_results.items():
-            # Prepare individual results for JSON
-            task_results = []
-            for i, pred in enumerate(pred_list):
-                gt_label = ground_truth[i].get(task) if i < len(ground_truth) else None
-                
-                json_entry = {
-                    'sample_id': pred.sample_id,
-                    'input_text': pred.input_text,
-                    'image_path': pred.image_path,
-                    'raw_llm_output': pred.raw_llm_output,
-                    'reasoning': pred.reasoning,
-                    'prediction_letter': pred.prediction,
-                    'predicted_label': pred.label,
-                    'ground_truth': gt_label,
-                    'correct': pred.label == gt_label if gt_label else None
-                }
-                task_results.append(json_entry)
-                
-                # Add to CSV data (one row per prediction)
-                csv_entry = {
+            for pred in pred_list:
+                sample_index = None
+                if pred.sample_id is not None:
+                    sample_index = int(pred.sample_id) - 1
+                gt_label = None
+                if sample_index is not None and 0 <= sample_index < len(ground_truth):
+                    gt_label = ground_truth[sample_index].get(task)
+
+                csv_data.append({
                     'mode': mode,
                     'task': task,
                     'sample_id': pred.sample_id,
                     'image_filename': f"{pred.sample_id}.jpg" if pred.sample_id else None,
-                    'image_path': pred.image_path,
-                    'input_text': pred.input_text,
-                    'prediction_letter': pred.prediction,
                     'predicted_label': pred.label,
+                    'prediction_letter': pred.prediction,
                     'ground_truth': gt_label,
                     'correct': pred.label == gt_label if gt_label else None,
+                    'input_text': pred.input_text,
                     'reasoning': pred.reasoning,
-                    'raw_llm_output': pred.raw_llm_output
-                }
-                csv_data.append(csv_entry)
-            
-            json_results[mode][task] = task_results
-            
-            # Calculate accuracy
-            predictions = [pr.label for pr in pred_list]
-            gt_labels = [ground_truth[i].get(task) for i in range(len(pred_list)) 
-                        if i < len(ground_truth) and task in ground_truth[i]]
-            
-            if gt_labels and len(predictions) == len(gt_labels):
-                correct = sum(1 for p, g in zip(predictions, gt_labels) if p == g)
-                accuracy = correct / len(gt_labels)
-                
-                summaries[mode][task] = {
-                    'accuracy': accuracy,
-                    'total_samples': len(gt_labels),
-                    'correct_predictions': correct,
-                    'label_distribution': dict(Counter(predictions))
-                }
-    
-    # Save JSON
-    json_output = {
-        'results': json_results,
-        'summary': summaries,
-        'config': {
-            'dataset': 'MSED',
-            'tasks': ['sentiment', 'emotion', 'desire'],
-            'seed': seed
-        }
-    }
-    
-    json_path = output_path.replace('.csv', '.json') if output_path.endswith('.csv') else f"{output_path}.json"
-    with open(json_path, 'w', encoding='utf-8') as f:
-        json.dump(json_output, f, indent=2, ensure_ascii=False)
-    
-    # Save CSV
-    csv_path = output_path if output_path.endswith('.csv') else f"{output_path}.csv"
-    csv_df = pd.DataFrame(csv_data)
-    
-    # Reorder columns for better readability
+                    'raw_llm_output': pred.raw_llm_output,
+                    'image_path': pred.image_path
+                })
+
+    existing_df = pd.DataFrame()
+    if os.path.exists(csv_path):
+        try:
+            existing_df = pd.read_csv(csv_path)
+        except Exception as e:
+            print(f"Warning: Could not read existing CSV during final save: {e}", flush=True)
+
+    new_df = pd.DataFrame(csv_data)
+    frames = [df for df in [existing_df, new_df] if not df.empty]
+    if frames:
+        csv_df = pd.concat(frames, ignore_index=True)
+        if {"mode", "task", "sample_id"}.issubset(csv_df.columns):
+            csv_df = csv_df.drop_duplicates(subset=["mode", "task", "sample_id"], keep="first")
+    else:
+        csv_df = pd.DataFrame(columns=[
+            'mode', 'task', 'sample_id', 'image_filename', 'predicted_label',
+            'prediction_letter', 'ground_truth', 'correct', 'input_text',
+            'reasoning', 'raw_llm_output', 'image_path'
+        ])
+
     column_order = [
         'mode', 'task', 'sample_id', 'image_filename', 
         'predicted_label', 'prediction_letter', 'ground_truth', 'correct',
         'input_text', 'reasoning', 'raw_llm_output', 'image_path'
     ]
-    # Only include columns that exist
     column_order = [col for col in column_order if col in csv_df.columns]
     csv_df = csv_df[column_order]
-    
     csv_df.to_csv(csv_path, index=False, encoding='utf-8')
-    
+
+    # Build JSON + summary from final merged CSV, not only from the current run.
+    json_results = {}
+    summaries = {}
+
+    if not csv_df.empty:
+        for mode in sorted(csv_df['mode'].dropna().unique()):
+            mode_df = csv_df[csv_df['mode'] == mode]
+            json_results[mode] = {}
+            summaries[mode] = {}
+
+            for task in tasks:
+                task_df = mode_df[mode_df['task'] == task]
+                if task_df.empty:
+                    continue
+
+                json_results[mode][task] = task_df.to_dict(orient='records')
+
+                eval_df = task_df[
+                    task_df['ground_truth'].notna() &
+                    task_df['predicted_label'].notna()
+                ].copy()
+
+                if not eval_df.empty:
+                    correct = (eval_df['predicted_label'] == eval_df['ground_truth']).sum()
+                    total = len(eval_df)
+                    summaries[mode][task] = {
+                        'accuracy': float(correct / total) if total else None,
+                        'total_samples': int(total),
+                        'correct_predictions': int(correct),
+                        'label_distribution': dict(Counter(task_df['predicted_label'].dropna()))
+                    }
+
+    json_output = {
+        'results': json_results,
+        'summary': summaries,
+        'config': {
+            'dataset': 'MSED/captions_test',
+            'tasks_evaluated': tasks,
+            'seed': seed,
+            'resume_enabled': True,
+            'note': 'Tasks are evaluated only when corresponding ground-truth labels exist in the dataset.'
+        }
+    }
+
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(json_output, f, indent=2, ensure_ascii=False)
+
     print(f"\nResults saved to:", flush=True)
     print(f"   - CSV: {csv_path}", flush=True)
     print(f"   - JSON: {json_path}", flush=True)
-    
-    # Print summary
+
     print(f"\n{'='*80}", flush=True)
     print("RESULTS SUMMARY", flush=True)
     print(f"{'='*80}", flush=True)
-    
+
     for mode, mode_summary in summaries.items():
         print(f"\n{mode.upper()} Results:", flush=True)
         for task, stats in mode_summary.items():
             print(f"  {task.capitalize()}:", flush=True)
             print(f"    Accuracy: {stats['accuracy']:.4f} ({stats['correct_predictions']}/{stats['total_samples']})", flush=True)
             print(f"    Distribution: {stats['label_distribution']}", flush=True)
-    
-    print(f"\n{'='*80}", flush=True)
-    print(f"Total CSV rows: {len(csv_df)}", flush=True)
-    print(f"{'='*80}", flush=True)
+
+    skipped_tasks = [task for task in ["sentiment", "emotion", "desire"] if task not in tasks]
+    if skipped_tasks:
+        print(f"\nSkipped task evaluation because ground-truth labels are unavailable: {skipped_tasks}", flush=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='MSED Multi-task Analysis with LLaVA')
+    parser = argparse.ArgumentParser(description='MSED Multi-task Analysis with Groq Llama 3.3 70B')
     parser.add_argument('--dataset-path', type=str, required=True,
                        help='Path to MSED dataset directory')
     parser.add_argument('--split', type=str, choices=['train', 'dev', 'test'], 
@@ -800,8 +803,8 @@ def main():
     parser.add_argument('--output-path', type=str, default='msed_llava_results',
                        help='Output file path (without extension)')
     parser.add_argument('--model-name', type=str, 
-                       default='llava-hf/llava-v1.6-mistral-7b-hf',
-                       help='Model name (use HF-converted LLaVA versions)')
+                       default='llama-3.3-70b-versatile',
+                       help='Groq model name')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--debug-mode', action='store_true', default=False,
@@ -812,12 +815,14 @@ def main():
     args = parser.parse_args()
     
     print("="*80, flush=True)
-    print("MSED MULTI-TASK ANALYSIS WITH LLAVA-1.6", flush=True)
+    print("MSED MULTI-TASK ANALYSIS WITH GROQ LLAMA-3.3-70B", flush=True)
     print("="*80, flush=True)
     print(f"Dataset path: {args.dataset_path}", flush=True)
     print(f"Split: {args.split}", flush=True)
     print(f"Sample limit: {args.limit if args.limit else 'All'}", flush=True)
     print(f"Mode: {args.mode}", flush=True)
+    if args.mode != "text":
+        print("Note: Groq llama-3.3-70b-versatile is text-only. Use --mode text for caption experiments.", flush=True)
     print(f"Debug mode: {args.debug_mode}", flush=True)
     print(f"Random seed: {args.seed}", flush=True)
     
@@ -845,15 +850,36 @@ def main():
         print("No samples loaded. Exiting.", flush=True)
         return
     
+    # Decide which tasks to evaluate from the annotations actually available in this dataset.
+    available_tasks = get_available_tasks(ground_truth)
+    if not available_tasks:
+        print("No ground-truth task annotations found in this dataset. Exiting without evaluation.", flush=True)
+        return
+
+    print(f"\nTasks with ground-truth annotations in this dataset: {available_tasks}", flush=True)
+    excluded_tasks = [task for task in ["sentiment", "emotion", "desire"] if task not in available_tasks]
+    if excluded_tasks:
+        print(f"Excluding tasks without ground truth: {excluded_tasks}", flush=True)
+
+    existing_keys = get_existing_completed_keys(args.output_path)
+    if existing_keys:
+        print(f"Resume enabled: found {len(existing_keys)} completed predictions in existing output file.", flush=True)
+
     # Perform analysis based on mode
     results = {}
-    
+
     if args.mode in ['text', 'all']:
         print(f"\n{'='*80}", flush=True)
         print("TEXT-ONLY ANALYSIS", flush=True)
         print("="*80, flush=True)
-        results['text_only'] = analyzer.analyze_text_only(texts, sample_ids)
-    
+        results['text_only'] = analyzer.analyze_text_only(
+            texts, sample_ids, image_paths,
+            tasks=available_tasks,
+            ground_truth=ground_truth,
+            output_path=args.output_path,
+            existing_keys=existing_keys
+        )
+
     if args.mode in ['image', 'all']:
         print(f"\n{'='*80}", flush=True)
         print("IMAGE-ONLY ANALYSIS", flush=True)
@@ -871,7 +897,7 @@ def main():
     print("SAVING RESULTS", flush=True)
     print("="*80, flush=True)
     
-    save_results(results, ground_truth, args.output_path, args.seed)
+    save_results(results, ground_truth, args.output_path, args.seed, tasks=available_tasks)
     
     # Print completion
     print(f"\n{'='*80}", flush=True)
